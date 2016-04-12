@@ -19,26 +19,35 @@ class ModelMeta(type):
         self._state = State()
         self._state.primary_key = None
         self._state.fields = OrderedDict()
+        self._state.meta = {}
 
         for parent_cls in cls:
             if issubclass(parent_cls, BaseModel) and not parent_cls == BaseModel:
                 self._state = copy.deepcopy(parent_cls._state)
+            elif hasattr(parent_cls, 'Meta'):
+                for k in dir(parent_cls.Meta):
+                    self._state.meta[k] = getattr(parent_cls.Meta, k)
+
+        if 'Meta' in attrs:
+            self._state.meta.update(attrs['Meta'])
 
         self._state.cls_name = name
+
+        # Other fields that relate this model
+        self._state.relates_from = []
+
+        # Relations within this field
+        self._state.relates_to = []
+
         self._resolve_fields(attrs)
-        self._resolve_meta(attrs)
+        self._resolve_meta()
 
-    def _resolve_meta(self, attrs):
-        if 'Meta' not in attrs:
-            return
-
-        meta = attrs.get('Meta')
-
-        self._state.conn = getattr(meta, 'conn')
-        self._state.name = getattr(meta, 'table_name', self._state.cls_name.lower())
+    def _resolve_meta(self):
+        self._state.conn = self._state.meta.get('conn')
+        self._state.name = self._state.meta.get('table_name', self._state.cls_name.lower())
         self._state.table = r.table(self._state.name)
-        self._state.dura = getattr(meta, 'durability', 'hard')
-        self._state.shards = getattr(meta, 'shards', 1)
+        self._state.dura = self._state.meta.get('durability', 'hard')
+        self._state.shards = self._state.meta.get('shards', 1)
 
     def _resolve_fields(self, attrs):
         for k, v in attrs.iteritems():
@@ -52,6 +61,8 @@ class ModelMeta(type):
                     self._state.primary_key = v
                 else:
                     raise Exception("Multiple primary keys passed")
+
+            v.resolve(self)
 
         if not self._state.primary_key:
             raise Exception("No primary-key specified")
@@ -96,14 +107,13 @@ class Model(BaseModel):
         self._loaded = True
 
         for k, v in obj.iteritems():
-            # TOOD check if valid filed
-            setattr(self, k, v)
+            setattr(self, k, getattr(self, k).from_type(v))
 
         return self
 
     @classmethod
     def create(cls, *args, **kwargs):
-        return cls(*args, **kwargs).save()
+        return cls(*args, **kwargs).save(create=True)
 
     def validate(self):
         for k, v in self._state.fields.items():
@@ -111,8 +121,10 @@ class Model(BaseModel):
             if isinstance(value, BaseField):
                 if value.primary:
                     continue
+
+                # If we have a default value, fill it in
                 if value._has_default:
-                    value = value.default
+                    value = value.get_default()
                 else:
                     value = None
             v.validate(value)
@@ -120,6 +132,10 @@ class Model(BaseModel):
     @property
     def _primary(self):
         return getattr(self, self._state.primary_key.name)
+
+    @_primary.setter
+    def _primary(self, val):
+        setattr(self, self._state.primary_key.name, val)
 
     def _get_object(self):
         self.validate()
@@ -132,7 +148,8 @@ class Model(BaseModel):
         data = self._get_object()
 
         if isinstance(self._primary, BaseField) or create:
-            self._state.table.insert(data).run(self._state.conn)
+            res = self._state.table.insert(data).run(self._state.conn)
+            self._primary = res['generated_keys'][0]
         else:
             self._state.table.get(self._primary).update(data).run(self._state.conn)
         return self

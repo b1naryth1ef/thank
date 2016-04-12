@@ -1,4 +1,4 @@
-from .fields import BaseField
+from rethinkdb import r
 
 
 class QueryResult(object):
@@ -41,36 +41,65 @@ class Query(object):
         self.table = self.parent._state.table
         self.conn = self.parent._state.conn
 
-        self._filters = {}
+        self.filter_raw = []
         self._only = set()
+        self._join = {}
 
-    def _compile(self):
+    def compile(self):
         q = self.table
-        if self._filters:
-            q = self.table.filter(self._filters)
+
+        # Seperate filter argument
+        if self.filter_raw:
+            q = self.table.filter(reduce(lambda a, b: a & b, self.filter_raw))
+
+        # Joins cause a merge function to be executed
+        if self._join:
+            for k, v in self._join.iteritems():
+                q = q.merge(lambda z: {
+                    k: r.table(k).get(z[v])
+                })
         return q
 
+    def debug(self):
+        return self.compile().run(self.conn)
+
     def filter_by(self, **kwargs):
-        self._filters.update(kwargs)
+        for k, v in kwargs.iteritems():
+            if hasattr(v, '_primary'):
+                v = v._primary
+            self.filter_raw.append(r.row[k] == v)
+        return self
+
+    def filter(self, *args):
+        self.filter_raw += list(args)
         return self
 
     def only(self, *args):
         for arg in args:
-            if isinstance(arg, BaseField):
+            if hasattr(arg, 'name'):
                 self._only.add(arg.name)
             else:
                 # TODO: validate
                 self._only.add(str(arg))
         return self
 
+    def join(self, other):
+        our_field = next((field for field in self.parent._state.relates_to if field.obj == other), None)
+        if not our_field:
+            raise Exception("Cannot join on Model %v, no relation" % other)
+
+        self._join[other._state.name] = our_field.name
+
+        return self
+
     def one(self):
-        return list(QueryResult(self, self._compile().limit(1).run(self.conn)))[0]
+        return list(QueryResult(self, self.compile().limit(1).run(self.conn)))[0]
 
     def all(self, cached=True):
-        return QueryResult(self, self._compile().run(self.conn), cached=cached)
+        return QueryResult(self, self.compile().run(self.conn), cached=cached)
 
     def count(self):
-        return self._compile().count().run(self.conn)
+        return self.compile().count().run(self.conn)
 
     def delete(self):
-        return self._compile().delete().run(self.conn)['deleted']
+        return self.compile().delete().run(self.conn)['deleted']
